@@ -72,9 +72,20 @@ export default function App() {
         }),
       });
 
-      const payload = (await response.json()) as GradeApiResponse & { error?: string };
-      if (!response.ok) {
-        throw new Error(payload.error || `Grading failed with status ${response.status}`);
+      const rawBody = await response.text();
+      let payload: (GradeApiResponse & { error?: string }) | null = null;
+      try {
+        payload = JSON.parse(rawBody) as GradeApiResponse & { error?: string };
+      } catch {
+        throw new Error(
+          response.ok
+            ? 'Received an invalid response format from the grading server.'
+            : `Grading request failed (HTTP ${response.status}). Please retry in a few seconds.`,
+        );
+      }
+
+      if (!response.ok || !payload) {
+        throw new Error(payload?.error || `Grading failed with status ${response.status}`);
       }
 
       setResult(payload);

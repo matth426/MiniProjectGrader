@@ -155,8 +155,6 @@ function summarizeStatsForPrompt(csv: CsvVerificationResult, nb: NotebookAnalysi
         hiddenHtmlComments: nb.hiddenHtmlComments,
       },
     },
-    null,
-    2,
   );
 }
 
@@ -197,6 +195,8 @@ function parseUpstreamError(err: unknown): { status: number; message: string; is
     lower.includes('high demand') ||
     lower.includes('overloaded') ||
     lower.includes('timeout') ||
+    lower.includes('timed out') ||
+    lower.includes('abort') ||
     lower.includes('econnreset');
 
   if (parsedStatus === 403 || parsedStatus === 400 || lower.includes('api_key_invalid')) {
@@ -285,8 +285,8 @@ async function startServer() {
         hasError: c.hasError,
         isTodoOnly: c.isTodoOnly,
         isPlaceholderOnly: c.isPlaceholderOnly,
-        source: c.source.slice(0, 2200),
-        output: c.outputsText.slice(0, 1200),
+        source: c.source.slice(0, 1600),
+        output: c.outputsText.slice(0, 800),
       }));
 
       const rubricPromptList = RUBRIC_SPECS.map(
@@ -324,7 +324,7 @@ DETERMINISTIC CSV VERIFICATION & RECOMPUTED STATISTICS:
 ${verificationContext}
 
 NOTEBOOK CELLS (HTML comments stripped for safety):
-${JSON.stringify(cellsDigest, null, 2)}
+${JSON.stringify(cellsDigest)}
 
 Produce the complete structured grading report now.`;
 
@@ -414,12 +414,16 @@ Produce the complete structured grading report now.`;
         ],
       };
 
-      const attempts: Array<{ model: string; useLowThinking: boolean; delayBeforeMs: number }> = [
-        { model: 'gemini-4-hydrogen', useLowThinking: true, delayBeforeMs: 0 },
-        { model: 'gemini-4-hydrogen', useLowThinking: true, delayBeforeMs: 1200 },
-        { model: 'gemini-4-hydrogen', useLowThinking: true, delayBeforeMs: 2600 },
-        { model: 'gemini-3.1-flash-lite', useLowThinking: false, delayBeforeMs: 800 },
-        { model: 'gemini-3.1-flash-lite', useLowThinking: false, delayBeforeMs: 2200 },
+      const attempts: Array<{
+        model: string;
+        thinkingLevel: ThinkingLevel;
+        delayBeforeMs: number;
+        timeoutMs: number;
+      }> = [
+        { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 0, timeoutMs: 16000 },
+        { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL, delayBeforeMs: 200, timeoutMs: 25000 },
+        { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL, delayBeforeMs: 1000, timeoutMs: 30000 },
+        { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW, delayBeforeMs: 1000, timeoutMs: 25000 },
       ];
 
       let rawText = '';
@@ -427,33 +431,38 @@ Produce the complete structured grading report now.`;
 
       for (const attempt of attempts) {
         if (attempt.delayBeforeMs > 0) {
-          await sleep(attempt.delayBeforeMs + Math.floor(Math.random() * 400));
+          await sleep(attempt.delayBeforeMs + Math.floor(Math.random() * 250));
         }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), attempt.timeoutMs);
         try {
-          const response = await ai.models.generateContent({
-            model: attempt.model,
-            contents: userPrompt,
-            config: {
-              systemInstruction,
-              responseMimeType: 'application/json',
-              seed: 42,
-              responseSchema,
-              ...(attempt.useLowThinking
-                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-                : {}),
-            },
-          });
+          const response = await Promise.race([
+            ai.models.generateContent({
+              model: attempt.model,
+              contents: userPrompt,
+              config: {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                seed: 42,
+                responseSchema,
+                abortSignal: controller.signal,
+                thinkingConfig: { thinkingLevel: attempt.thinkingLevel },
+              },
+            }),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error(`Upstream timeout after ${attempt.timeoutMs}ms`)), attempt.timeoutMs),
+            ),
+          ]);
           rawText = (response.text || '').trim();
           if (rawText) break;
         } catch (err) {
           lastErr = err;
           const info = parseUpstreamError(err);
-          console.warn(
-            `Gemini attempt failed (${attempt.model}, status=${info.status}): ${info.message}`,
-          );
           if (!info.isTransient) {
             throw err;
           }
+        } finally {
+          clearTimeout(timer);
         }
       }
 
